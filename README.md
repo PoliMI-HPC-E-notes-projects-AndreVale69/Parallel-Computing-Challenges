@@ -1,2 +1,4 @@
-# Parallel-Computing-Challenges
-University project of the Parallel Computing course.
+# Parallel Computing Challenges
+
+- [Challenge 1](challenge-1)
+- [Challenge 2](challenge-2)
