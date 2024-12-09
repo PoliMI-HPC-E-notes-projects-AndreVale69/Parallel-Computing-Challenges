@@ -4,7 +4,7 @@
 #include <fstream>
 
 #define MATRIX_SIZE 1024
-#define CPU_MATRIX_SIZE 1024
+#define TILE_WIDTH 32
 
 using namespace std;
 
@@ -39,6 +39,100 @@ __global__ void convolution_2D_basic_kernel(
         // Write our new pixel value out
         out[row * w + col] = pixVal;
     }
+}
+
+__global__ void convolution_2D_tiled_kernel(
+    const int *in,
+    int *out,
+    const int *mask,
+    const int mask_width,
+    const int w,
+    const int h,
+    const int tile_width
+) {
+    __shared__ int N_ds[TILE_WIDTH][TILE_WIDTH];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row_o = blockIdx.y * tile_width + ty;
+    const int col_o = blockIdx.x * tile_width + tx;
+    const int row_i = row_o - mask_width / 2;
+    const int col_i = col_o - mask_width / 2;
+
+    if ((row_i >= 0) && (row_i < h) && (col_i >= 0) && (col_i < w)) {
+        N_ds[ty][tx] = in[row_i * w + col_i];
+    } else {
+        N_ds[ty][tx] = 0;
+    }
+
+    __syncthreads();
+
+    if (ty < tile_width && tx < tile_width) {
+        int output = 0;
+        for (int i = 0; i < mask_width; ++i) {
+            for (int j = 0; j < mask_width; ++j) {
+                output += mask[i * mask_width + j] * N_ds[i + ty][j + tx];
+            }
+        }
+        if (row_o < h && col_o < w) {
+            out[row_o * w + col_o] = output;
+        }
+    }
+}
+
+// TODO: does not work
+__global__ void convolution_2D_dynamic_tiled_kernel(
+    const int *in,
+    int *out,
+    const int *mask,
+    const int mask_width,
+    const int w,
+    const int h,
+    const int tile_width
+) {
+    extern __shared__ int N_ds[];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row_o = blockIdx.y * tile_width + ty;
+    const int col_o = blockIdx.x * tile_width + tx;
+    const int row_i = row_o - mask_width / 2;
+    const int col_i = col_o - mask_width / 2;
+
+    const int sharedMemDim = tile_width + mask_width - 1;
+    int* N_ds_tile = &N_ds[0];
+
+    if ((row_i >= 0) && (row_i < h) && (col_i >= 0) && (col_i < w)) {
+        N_ds_tile[ty * sharedMemDim + tx] = in[row_i * w + col_i];
+    } else {
+        N_ds_tile[ty * sharedMemDim + tx] = 0;
+    }
+
+    __syncthreads();
+
+    if (ty < tile_width && tx < tile_width) {
+        int output = 0;
+        for (int i = 0; i < mask_width; ++i) {
+            for (int j = 0; j < mask_width; ++j) {
+                output += mask[i * mask_width + j] * N_ds_tile[(i + ty) * sharedMemDim + (j + tx)];
+            }
+        }
+        if (row_o < h && col_o < w) {
+            out[row_o * w + col_o] = output;
+        }
+    }
+}
+
+/**
+ * Get the dynamic tile width for the current device.
+ * @return Tile width.
+ */
+int get_dynamic_tile_width() {
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, 0);
+    int maxThreadsPerBlock = prop.maxThreadsPerBlock;
+    int tileWidth = static_cast<int>(sqrt(maxThreadsPerBlock));
+    return tileWidth;
 }
 
 /**
@@ -126,6 +220,60 @@ int main(int argc, char const *argv[]) {
 
         cudaEventRecord(start, nullptr);
         convolution_2D_basic_kernel<<<dimGrid, dimBlock>>>(in, mask, out, mask_size, MATRIX_SIZE, MATRIX_SIZE);
+        cudaDeviceSynchronize();
+
+        // time counting terminate
+
+        cudaEventRecord(stop, nullptr);
+        cudaEventSynchronize(stop);
+
+        // compute time elapsed on GPU computing
+        cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
+        printf("Time elapsed on naive GPU matrix multiplication of %dx%d . %dx%d (%d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, block_size, naive_gpu_elapsed_time_ms);
+
+        // free memory
+        cudaFree(mask);
+        cudaFree(in);
+        cudaFree(out);
+    }
+
+    printf("\n\n ----- TILING: \n\n");
+
+    for(block_size= 4; block_size <= 32; block_size *= 2)
+    {
+        // reserve size
+        const int mask_boundary = mask_size * mask_size;
+        const int out_boundary = mask_size + MATRIX_SIZE - 1;
+        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_boundary * mask_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * MATRIX_SIZE * MATRIX_SIZE);
+        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * out_boundary * out_boundary);
+
+        // create mask matrix
+        // create_mask_matrix(mask, mask_size);
+        create_constant_matrix(mask, mask_size, 3);
+        // create constant matrix (input)
+        create_constant_matrix(in, MATRIX_SIZE, 2);
+        // initialize output matrix
+        create_constant_matrix(out, out_boundary, 0);
+
+
+        float  naive_gpu_elapsed_time_ms;
+
+        // some events to count the execution time
+        //clock_t st, end;
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+
+        unsigned int grid_rows = (MATRIX_SIZE + block_size - 1) / block_size;
+        unsigned int grid_cols = (MATRIX_SIZE + block_size - 1) / block_size;
+        dim3 dimGrid(grid_cols, grid_rows);
+        dim3 dimBlock(block_size, block_size);
+
+
+        cudaEventRecord(start, nullptr);
+        convolution_2D_tiled_kernel<<<dimGrid, dimBlock>>>(in, out, mask, mask_size, MATRIX_SIZE, MATRIX_SIZE, get_dynamic_tile_width());
         cudaDeviceSynchronize();
 
         // time counting terminate
