@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -35,6 +34,18 @@ __global__ void gpu_convolution(int *matrix,int *mask, int *res, int maskwidth, 
 
     
 }
+
+void printMatrix(const int* matrix, int width, int height, const char* name) {
+    printf("Matrix %s:\n", name);
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            printf("%d ", matrix[i * width + j]);
+        }
+        printf("\n");
+    }
+    printf("\n");
+}
+
 
 int main(int argc, char const *argv[])
 {
@@ -74,11 +85,15 @@ int main(int argc, char const *argv[])
         }
 
         // initialize matrix B
-        for (int i = 0; i < HEIGHT; ++i) {
-            for (int j = 0; j < WIDTH; ++j) {
-                b[i * WIDTH + j] = 3;
+        for (int i = 0; i < MASK_HEIGHT; ++i) {
+            for (int j = 0; j < MASK_WIDTH; ++j) {
+                b[i * MASK_WIDTH + j] = 3;
             }
         }
+
+        // Stampa le matrici dopo l inizializzazione
+        printMatrix(a, WIDTH, HEIGHT, "A");
+        printMatrix(b, MASK_WIDTH, MASK_HEIGHT, "B");
 
 
         float  naive_gpu_elapsed_time_ms;
@@ -90,16 +105,17 @@ int main(int argc, char const *argv[])
         cudaEventCreate(&stop);
 
 
-        unsigned int grid_rows = (WIDTH*HEIGHT + block_size - 1) / block_size;
-        unsigned int grid_cols = (WIDTH*HEIGHT + block_size - 1) / block_size;
+        unsigned int grid_cols = (WIDTH + block_size - 1) / block_size;
+        unsigned int grid_rows = (HEIGHT + block_size - 1) / block_size;
         dim3 dimGrid(grid_cols, grid_rows);
         dim3 dimBlock(block_size, block_size);
 
 
         cudaEventRecord(start, 0);
         gpu_convolution<<<dimGrid, dimBlock>>>(a, b, c, MASK_WIDTH, WIDTH, HEIGHT);
-        cudaThreadSynchronize();
-
+        cudaDeviceSynchronize();
+        // Stampa la matrice risultato
+        printMatrix(c, WIDTH, HEIGHT, "C"); 
         // time counting terminate
 
         cudaEventRecord(stop, 0);
