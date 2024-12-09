@@ -3,7 +3,7 @@
 #include <cuda.h>
 #include <fstream>
 
-#define MATRIX_SIZE 16384
+#define MATRIX_SIZE 10
 
 using namespace std;
 
@@ -52,19 +52,29 @@ __global__ void convolution_2D_tiled_kernel(
     const int row_i = row_o - mask_width / 2;
     const int col_i = col_o - mask_width / 2;
 
-    if ((row_i >= 0) && (row_i < h) && (col_i >= 0) && (col_i < w)) {
-        N_ds[ty * tile_width + tx] = in[row_i * w + col_i];
-    } else {
-        N_ds[ty * tile_width + tx] = 0;
+    const int sharedMemDim = tile_width + mask_width - 1;
+
+    // Ensure boundary checks for shared memory
+    if (ty < sharedMemDim && tx < sharedMemDim) {
+        if (row_i >= 0 && row_i < h && col_i >= 0 && col_i < w) {
+            N_ds[ty * sharedMemDim + tx] = in[row_i * w + col_i];
+        } else {
+            N_ds[ty * sharedMemDim + tx] = 0;
+        }
     }
 
     __syncthreads();
 
+    // Perform convolution within valid range
     if (ty < tile_width && tx < tile_width) {
         int output = 0;
         for (int i = 0; i < mask_width; ++i) {
             for (int j = 0; j < mask_width; ++j) {
-                output += mask[i * mask_width + j] * N_ds[(i + ty) * tile_width + (j + tx)];
+                int shared_i = ty + i;
+                int shared_j = tx + j;
+                if (shared_i < sharedMemDim && shared_j < sharedMemDim) {
+                    output += mask[i * mask_width + j] * N_ds[shared_i * sharedMemDim + shared_j];
+                }
             }
         }
         if (row_o < h && col_o < w) {
@@ -72,6 +82,7 @@ __global__ void convolution_2D_tiled_kernel(
         }
     }
 }
+
 
 /**
  * Print a matrix.
