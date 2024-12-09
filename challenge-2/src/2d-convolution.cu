@@ -15,27 +15,21 @@ __global__ void convolution_2D_basic_kernel(
     const int w,
     const int h
 ) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (const int row = blockIdx.y * blockDim.y + threadIdx.y; col < w && row < h) {
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int mask_width_half = mask_width / 2;
+    if(const int col = blockIdx.x * blockDim.x + threadIdx.x; col < w && row < h){
+        const int n_start_col = col - mask_width_half;
+        const int n_start_row = row - mask_width_half;
         int pixVal = 0;
 
-        const int n_start_col = col - (mask_width / 2);
-        const int n_start_row = row - (mask_width / 2);
-
-        // Get the sum of the surrounding box
-        for(int j = 0, cur_row = n_start_row; j < mask_width; ++j, ++cur_row) {
-            const int offset = cur_row * w;
-            const int mask_offset = j * mask_width;
-            for(int k = 0, cur_col = n_start_col; k < mask_width; ++k, ++cur_col) {
-                // Verify we have a valid image pixel
-                if(cur_row > -1 && cur_row < h && cur_col > -1 && cur_col < w) {
-                    pixVal += in[offset + cur_col] * mask[mask_offset + k];
+        for(int j = 0; j < mask_width; ++j){
+            const int curr_row = n_start_row + j;
+            for(int k = 0; k < mask_width; ++k){
+                if(const int curr_col = n_start_col + k; curr_row > -1 && curr_row < h && curr_col > -1 && curr_col < w){
+                    pixVal += in[curr_row * w + curr_col] * mask[j * mask_width + k];
                 }
             }
         }
-
-        // Write our new pixel value out
         out[row * w + col] = pixVal;
     }
 }
@@ -80,6 +74,21 @@ __global__ void convolution_2D_tiled_kernel(
 }
 
 /**
+ * Print a matrix.
+ * @param matrix Matrix to print.
+ * @param height Height of the matrix.
+ * @param width Width of the matrix.
+ */
+void print_matrix(const int* matrix, const int height, const int width) {
+    for (int i = 0; i < height; ++i) {
+        for (int j = 0; j < width; ++j) {
+            printf("%d ", matrix[i * height + j]);
+        }
+        printf("\n");
+    }
+}
+
+/**
  * Get the dynamic tile width for the current device.
  * @return Tile width.
  */
@@ -92,20 +101,20 @@ int get_dynamic_tile_width() {
 }
 
 /**
- * Create a mask matrix with random values between 0 and random_upper_bound.
- * @param mask Vector mask, it will be modified locally.
+ * Create a matrix with random values between 0 and random_upper_bound.
+ * @param result Result matrix.
  * @param rows Number of rows of the output mask, the matrix should be square.
  * @param random_upper_bound Upper limit for random number generation, 10 by default.
  * @throw invalid_argument If mask is null.
  */
-void create_mask_matrix(int *mask, const int rows, const int random_upper_bound = 10) {
-    if (mask == nullptr)
-        throw invalid_argument("Mask matrix cannot be null");
-    // init boud
+void create_random_matrix(int *result, const int rows, const int random_upper_bound = 10) {
+    if (result == nullptr)
+        throw invalid_argument("Result matrix cannot be null");
+    // init bound
     const int boundary = rows * rows;
-    // generate random values from 0 to 10
-    for(int i = 0; i < boundary; ++i)
-        mask[i] = static_cast<int>(random()) % random_upper_bound;
+    // insert values
+    for (int i = 0; i < boundary; ++i)
+        result[i] = static_cast<int>(random()) % random_upper_bound;
 }
 
 /**
@@ -115,7 +124,7 @@ void create_mask_matrix(int *mask, const int rows, const int random_upper_bound 
  * @param value Value to fill the matrix.
  * @throw invalid_argument If result is null.
  */
-int* create_constant_matrix(int *result, const int rows, const int value) {
+void create_constant_matrix(int *result, const int rows, const int value) {
     if (result == nullptr)
         throw invalid_argument("Result matrix cannot be null");
     // init bound
@@ -123,18 +132,18 @@ int* create_constant_matrix(int *result, const int rows, const int value) {
     // insert values
     for (int i = 0; i < boundary; ++i)
         result[i] = value;
-    return result;
 }
 
 int main(int argc, char const *argv[]) {
     // init
     constexpr int matrix_boundary = MATRIX_SIZE * MATRIX_SIZE;
-    int mask_size = 0, block_size;
+    int mask_width = 0, block_size;
     int *mask, *in, *out;
+    float naive_gpu_elapsed_time_ms = 0.0;
 
     // try to get env variable
     try {
-        mask_size = stoi(getenv("MASK_SIZE"));
+        mask_width = stoi(getenv("MASK_SIZE"));
     }
     catch (...) {
         printf("Error reading MASK_SIZE env variable; it must be an integer");
@@ -144,29 +153,22 @@ int main(int argc, char const *argv[]) {
     for(block_size= 4; block_size <= 32; block_size *= 2)
     {
         // reserve size
-        const int mask_boundary = mask_size * mask_size;
-        const int out_boundary = mask_size + MATRIX_SIZE - 1;
-        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_boundary * mask_boundary);
-        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * MATRIX_SIZE * MATRIX_SIZE);
-        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * out_boundary * out_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
+        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
 
         // create mask matrix
         // create_mask_matrix(mask, mask_size);
-        create_constant_matrix(mask, mask_size, 3);
+        create_constant_matrix(mask, mask_width, 3);
         // create constant matrix (input)
         create_constant_matrix(in, MATRIX_SIZE, 2);
         // initialize output matrix
-        create_constant_matrix(out, out_boundary, 0);
-
-
-        float  naive_gpu_elapsed_time_ms;
+        create_constant_matrix(out, MATRIX_SIZE, 0);
 
         // some events to count the execution time
-        //clock_t st, end;
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
-
 
         unsigned int grid_rows = (MATRIX_SIZE + block_size - 1) / block_size;
         unsigned int grid_cols = (MATRIX_SIZE + block_size - 1) / block_size;
@@ -175,7 +177,7 @@ int main(int argc, char const *argv[]) {
 
 
         cudaEventRecord(start, nullptr);
-        convolution_2D_basic_kernel<<<dimGrid, dimBlock>>>(in, mask, out, mask_size, MATRIX_SIZE, MATRIX_SIZE);
+        convolution_2D_basic_kernel<<<dimGrid, dimBlock>>>(in, mask, out, mask_width, MATRIX_SIZE, MATRIX_SIZE);
         cudaDeviceSynchronize();
 
         // time counting terminate
@@ -185,7 +187,11 @@ int main(int argc, char const *argv[]) {
 
         // compute time elapsed on GPU computing
         cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
-        printf("Time elapsed on naive GPU matrix multiplication of %dx%d . %dx%d (%d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, block_size, naive_gpu_elapsed_time_ms);
+
+        // debug uncomment:
+        // print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
+        // print result
+        printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, naive_gpu_elapsed_time_ms);
 
         // free memory
         cudaFree(mask);
@@ -193,46 +199,38 @@ int main(int argc, char const *argv[]) {
         cudaFree(out);
     }
 
-    printf("\n\n ----- TILING: \n\n");
+    printf("\n\n ---------- TILING ---------- \n\n");
+    // get dynamic tile
     const int tiling = get_dynamic_tile_width();
-    const int shared_memory_size = tiling * tiling * sizeof(int);
+    // tiling already depends on the block size of the device,
+    // so it is not necessary to include it in the for loop
+    const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
 
     for(block_size= 4; block_size <= 32; block_size *= 2)
     {
         // reserve size
-        const int mask_boundary = mask_size * mask_size;
-        const int out_boundary = mask_size + MATRIX_SIZE - 1;
-        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_boundary * mask_boundary);
-        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * MATRIX_SIZE * MATRIX_SIZE);
-        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * out_boundary * out_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
+        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
 
         // create mask matrix
-        // create_mask_matrix(mask, mask_size);
-        create_constant_matrix(mask, mask_size, 3);
+        create_constant_matrix(mask, mask_width, 3);
         // create constant matrix (input)
         create_constant_matrix(in, MATRIX_SIZE, 2);
         // initialize output matrix
-        create_constant_matrix(out, out_boundary, 0);
-
-
-        float  naive_gpu_elapsed_time_ms;
+        create_constant_matrix(out, MATRIX_SIZE, 0);
 
         // some events to count the execution time
-        //clock_t st, end;
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
 
-
-        unsigned int grid_rows = (MATRIX_SIZE + block_size - 1) / block_size;
-        unsigned int grid_cols = (MATRIX_SIZE + block_size - 1) / block_size;
-        dim3 dimGrid(grid_cols, grid_rows);
-        dim3 dimBlock(block_size, block_size);
-
-
         cudaEventRecord(start, nullptr);
 
-        convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_size, MATRIX_SIZE, MATRIX_SIZE, tiling);
+        dim3 dimBlock(tiling, tiling);
+        dim3 dimGrid((MATRIX_SIZE + tiling - 1) / tiling, (MATRIX_SIZE + tiling - 1) / tiling);
+
+        convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_width, MATRIX_SIZE, MATRIX_SIZE, tiling);
         cudaDeviceSynchronize();
 
         // time counting terminate
@@ -242,7 +240,11 @@ int main(int argc, char const *argv[]) {
 
         // compute time elapsed on GPU computing
         cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
-        printf("Time elapsed on naive GPU matrix multiplication of %dx%d . %dx%d (%d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, block_size, naive_gpu_elapsed_time_ms);
+
+        // debug uncomment:
+        // print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
+        // print result
+        printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, naive_gpu_elapsed_time_ms);
 
         // free memory
         cudaFree(mask);
