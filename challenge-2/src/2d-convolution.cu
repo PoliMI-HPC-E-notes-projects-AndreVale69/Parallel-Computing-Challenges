@@ -4,13 +4,15 @@
 #include <iostream>
 #include <random>
 
-#define MATRIX_SIZE 8192
+#define MATRIX_SIZE 5
 #define CPU_MATRIX_SIZE 1024
 
+using namespace std;
+
 __global__ void convolution_2D_basic_kernel(
-    const unsigned char * in,
-    const unsigned char * mask,
-    unsigned char * out,
+    const int * in,
+    const int * mask,
+    int * out,
     const int mask_width,
     const int w,
     const int h
@@ -36,20 +38,7 @@ __global__ void convolution_2D_basic_kernel(
         }
 
         // Write our new pixel value out
-        out[row * w + col] = static_cast<unsigned char>(pixVal);
-    }
-}
-
-
-__global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n) {
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
-    if(const int col = blockIdx.x * blockDim.x + threadIdx.x; col < n && row < n)
-    {
-        const int offset = row * n;
-        int sum = 0;
-        for(int i = 0; i < n; ++i)
-            sum += a[offset + i] * b[i * n + col];
-        c[offset + col] = sum;
+        out[row * w + col] = pixVal;
     }
 }
 
@@ -58,57 +47,93 @@ __global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n)
  * @param mask Vector mask, it will be modified locally.
  * @param rows Number of rows of the output mask, the matrix should be square.
  * @param random_upper_bound Upper limit for random number generation, 10 by default.
+ * @throw invalid_argument If mask is null.
  */
-void create_mask_matrix(std::vector<int> *mask, const int rows, const int random_upper_bound = 10) {
+void create_mask_matrix(int *mask, const int rows, const int random_upper_bound = 10) {
+    if (mask == nullptr)
+        throw invalid_argument("Mask matrix cannot be null");
     // init boud
     const int boundary = rows * rows;
-
-    // reserve size
-    mask->reserve(boundary);
-
     // generate random values from 0 to 10
-    for(int _ = 0; _ < boundary; ++_)
-        mask->emplace_back(random() % random_upper_bound);
+    for(int i = 0; i < boundary; ++i)
+        mask[i] = static_cast<int>(random()) % random_upper_bound;
+}
+
+/**
+ * Create a constant matrix with a specific value.
+ * @param result Constant matrix result.
+ * @param rows Rows of the final matrix, it should be square.
+ * @param value Value to fill the matrix.
+ * @throw invalid_argument If result is null.
+ */
+int* create_constant_matrix(int *result, const int rows, const int value) {
+    if (result == nullptr)
+        throw invalid_argument("Result matrix cannot be null");
+    // init bound
+    const int boundary = rows * rows;
+    // insert values
+    for (int i = 0; i < boundary; ++i)
+        result[i] = value;
+    return result;
 }
 
 int main(int argc, char const *argv[]) {
     // init
-    int mask_size = 0, block_size, n_devices;
-    std::vector<int> mask;
+    constexpr int matrix_boundary = MATRIX_SIZE * MATRIX_SIZE;
+    int mask_size = 0, block_size;
+    int *mask, *in, *out;
 
     // try to get env variable
     try {
-        mask_size = std::stoi(std::getenv("MASK_SIZE"));
+        mask_size = stoi(getenv("MASK_SIZE"));
     }
     catch (...) {
         printf("Error reading MASK_SIZE env variable; it must be an integer");
         return -1;
     }
-
+    // reserve size
+    const int mask_boundary = mask_size * mask_size;
+    const int out_boundary = mask_size + MATRIX_SIZE - 1;
+    mask = static_cast<int *>(malloc(sizeof(int) * mask_boundary * mask_boundary));
+    in = static_cast<int *>(malloc(sizeof(int) * matrix_boundary * matrix_boundary));
+    out = static_cast<int *>(malloc(sizeof(int) * out_boundary * out_boundary));
     // create mask matrix
-    create_mask_matrix(&mask, mask_size);
+    create_mask_matrix(mask, mask_size);
+    // create constant matrix (input)
+    create_constant_matrix(in, MATRIX_SIZE, 1);
+    // initialize output matrix
+    create_constant_matrix(out, out_boundary, 0);
 
     // debug: print values
-    for (int i = 0; i < mask_size*mask_size; ++i)
-        printf("mask[%d] = %d\n", i, mask.at(i));
+    for (int i = 0; i < mask_boundary; ++i)
+        printf("mask[%d] = %d\n", i, mask[i]);
+
+    for (int i = 0; i < MATRIX_SIZE*MATRIX_SIZE; ++i)
+        printf("in[%d] = %d\n", i, in[i]);
+
+    for (int i = 0; i < out_boundary; ++i)
+        printf("out[%d] = %d\n", i, out[i]);
+
+    // free
+    free(mask);
+    free(in);
+    free(out);
 
     // retrieve some info about the CUDA device
-    cudaGetDeviceCount(&n_devices);
-    for (int i = 0; i < n_devices; ++i) {
-      cudaDeviceProp prop{};
-      cudaGetDeviceProperties(&prop, i);
-      printf("Device Number: %d\n", i);
-      printf("  Device name: %s\n", prop.name);
-      printf("  max Blocks Per MultiProcessor: %d\n", prop.maxBlocksPerMultiProcessor);
-      printf("  max Threads Per MultiProcessor: %d\n", prop.maxThreadsPerMultiProcessor);
-      printf("  max Threads Per Block: %d\n", prop.maxThreadsPerBlock);
-      printf("  num SM: %d\n", prop.multiProcessorCount);
-      printf("  num bytes sharedMem Per Block: %lu\n", prop.sharedMemPerBlock);
-      printf("  num bytes sharedMem Per Multiprocessor: %lu\n", prop.sharedMemPerMultiprocessor);
-      printf("  Memory Clock Rate (KHz): %d\n", prop.memoryClockRate);
-      printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
-      printf("  Peak Memory Bandwidth (GB/s): %f\n\n", 2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
-    }
+    cudaGetDeviceCount(nullptr);
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, 0);
+    printf("Device Number: %d\n", 0);
+    printf("  Device name: %s\n", prop.name);
+    printf("  max Blocks Per MultiProcessor: %d\n", prop.maxBlocksPerMultiProcessor);
+    printf("  max Threads Per MultiProcessor: %d\n", prop.maxThreadsPerMultiProcessor);
+    printf("  max Threads Per Block: %d\n", prop.maxThreadsPerBlock);
+    printf("  num SM: %d\n", prop.multiProcessorCount);
+    printf("  num bytes sharedMem Per Block: %lu\n", prop.sharedMemPerBlock);
+    printf("  num bytes sharedMem Per Multiprocessor: %lu\n", prop.sharedMemPerMultiprocessor);
+    printf("  Memory Clock Rate (KHz): %d\n", prop.memoryClockRate);
+    printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
+    printf("  Peak Memory Bandwidth (GB/s): %f\n\n", 2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
 
     return 0;
 }
