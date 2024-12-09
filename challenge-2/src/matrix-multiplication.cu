@@ -7,36 +7,30 @@
 #define CPU_MATRIX_SIZE 1024
 
 
-__global__ void gpu_matrix_mult(int *a,int *b, int *c, int n)
+__global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if( col < n && row < n)
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if(const int col = blockIdx.x * blockDim.x + threadIdx.x; col < n && row < n)
     {
+        const int offset = row * n;
         int sum = 0;
-        for(int i = 0; i < n; i++)
-        {
-            sum += a[row * n + i] * b[i * n + col];
-        }
-        c[row * n + col] = sum;
+        for(int i = 0; i < n; ++i)
+            sum += a[offset + i] * b[i * n + col];
+        c[offset + col] = sum;
     }
 }
 
-void cpu_matrix_mult (int *a, int *b, int *c, int n)
+void cpu_matrix_mult (const int *a, const int *b, int *c, const int n)
 {
-    int i,j,k;
-    for (i = 0; i < n; i++)
-    {
-        for (j = 0; j < n; j++)
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
         {
+            const int offset = i * n;
             int sum_mult = 0;
-            for (k = 0; k < n; k++)
-            {
-                sum_mult += a[i*n+k] * b[k*n+j];
-            }
-            c[i*n+j] = sum_mult;
+            for (int k = 0; k < n; ++k)
+                sum_mult += a[offset + k] * b[k * n + j];
+            c[offset + j] = sum_mult;
         }
-    }
 }
 
 int main(int argc, char const *argv[])
