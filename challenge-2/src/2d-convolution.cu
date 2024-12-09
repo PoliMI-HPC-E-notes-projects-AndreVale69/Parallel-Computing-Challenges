@@ -4,11 +4,14 @@
 #include <cuda.h>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 
 #define MATRIX_SIZE 8192
 #define CPU_MATRIX_SIZE 1024
 
-__global__ void convolution_global_memory(float *n, float *m, float *o, int width, const int mask_width){
+__global__ void convolution_global_memory(
+    const float *n, const float *m, float *o, const int width, const int mask_width
+) {
 
 	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -23,8 +26,7 @@ __global__ void convolution_global_memory(float *n, float *m, float *o, int widt
 	o[i]=p_value;
 }
 
-__global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n)
-{
+__global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n) {
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
     if(const int col = blockIdx.x * blockDim.x + threadIdx.x; col < n && row < n)
     {
@@ -36,22 +38,29 @@ __global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n)
     }
 }
 
-void cpu_matrix_mult (const int *a, const int *b, int *c, int n)
-{
-    for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j)
-        {
-            const int offset = i * n;
-            int sum_mult = 0;
-            for (int k = 0; k < n; ++k)
-                sum_mult += a[offset + k] * b[k * n + j];
-            c[offset + j] = sum_mult;
-        }
+/**
+ * Create a mask matrix with random values between 0 and random_upper_bound.
+ * @param mask Vector mask, it will be modified locally.
+ * @param rows Number of rows of the output mask, the matrix should be square.
+ * @param random_upper_bound Upper limit for random number generation, 10 by default.
+ */
+void create_mask_matrix(std::vector<int> *mask, const int rows, const int random_upper_bound = 10) {
+    // init boud
+    const int boundary = rows * rows;
+
+    // reserve size
+    mask->reserve(boundary);
+
+    // generate random values from 0 to 10
+    for(int _ = 0; _ < boundary; ++_)
+        mask->emplace_back(random() % random_upper_bound);
 }
 
-int main(int argc, char const *argv[])
-{
+int main(int argc, char const *argv[]) {
+    // init
     int mask_size = 0, block_size, n_devices;
+    std::vector<int> mask;
+
     // try to get env variable
     try {
         mask_size = std::stoi(std::getenv("MASK_SIZE"));
@@ -61,10 +70,17 @@ int main(int argc, char const *argv[])
         return -1;
     }
 
+    // create mask matrix
+    create_mask_matrix(&mask, mask_size);
+
+    // debug: print values
+    for (int i = 0; i < mask_size*mask_size; ++i)
+        printf("mask[%d] = %d\n", i, mask.at(i));
+
     // retrieve some info about the CUDA device
     cudaGetDeviceCount(&n_devices);
     for (int i = 0; i < n_devices; ++i) {
-      cudaDeviceProp prop;
+      cudaDeviceProp prop{};
       cudaGetDeviceProperties(&prop, i);
       printf("Device Number: %d\n", i);
       printf("  Device name: %s\n", prop.name);
