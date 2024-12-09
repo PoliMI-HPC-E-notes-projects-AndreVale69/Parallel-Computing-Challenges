@@ -3,8 +3,7 @@
 #include <cuda.h>
 #include <fstream>
 
-#define MATRIX_SIZE 1024
-#define TILE_WIDTH 32
+#define MATRIX_SIZE 16384
 
 using namespace std;
 
@@ -50,46 +49,6 @@ __global__ void convolution_2D_tiled_kernel(
     const int h,
     const int tile_width
 ) {
-    __shared__ int N_ds[TILE_WIDTH][TILE_WIDTH];
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int row_o = blockIdx.y * tile_width + ty;
-    const int col_o = blockIdx.x * tile_width + tx;
-    const int row_i = row_o - mask_width / 2;
-    const int col_i = col_o - mask_width / 2;
-
-    if ((row_i >= 0) && (row_i < h) && (col_i >= 0) && (col_i < w)) {
-        N_ds[ty][tx] = in[row_i * w + col_i];
-    } else {
-        N_ds[ty][tx] = 0;
-    }
-
-    __syncthreads();
-
-    if (ty < tile_width && tx < tile_width) {
-        int output = 0;
-        for (int i = 0; i < mask_width; ++i) {
-            for (int j = 0; j < mask_width; ++j) {
-                output += mask[i * mask_width + j] * N_ds[i + ty][j + tx];
-            }
-        }
-        if (row_o < h && col_o < w) {
-            out[row_o * w + col_o] = output;
-        }
-    }
-}
-
-// TODO: does not work
-__global__ void convolution_2D_dynamic_tiled_kernel(
-    const int *in,
-    int *out,
-    const int *mask,
-    const int mask_width,
-    const int w,
-    const int h,
-    const int tile_width
-) {
     extern __shared__ int N_ds[];
 
     const int tx = threadIdx.x;
@@ -99,13 +58,10 @@ __global__ void convolution_2D_dynamic_tiled_kernel(
     const int row_i = row_o - mask_width / 2;
     const int col_i = col_o - mask_width / 2;
 
-    const int sharedMemDim = tile_width + mask_width - 1;
-    int* N_ds_tile = &N_ds[0];
-
     if ((row_i >= 0) && (row_i < h) && (col_i >= 0) && (col_i < w)) {
-        N_ds_tile[ty * sharedMemDim + tx] = in[row_i * w + col_i];
+        N_ds[ty * tile_width + tx] = in[row_i * w + col_i];
     } else {
-        N_ds_tile[ty * sharedMemDim + tx] = 0;
+        N_ds[ty * tile_width + tx] = 0;
     }
 
     __syncthreads();
@@ -114,7 +70,7 @@ __global__ void convolution_2D_dynamic_tiled_kernel(
         int output = 0;
         for (int i = 0; i < mask_width; ++i) {
             for (int j = 0; j < mask_width; ++j) {
-                output += mask[i * mask_width + j] * N_ds_tile[(i + ty) * sharedMemDim + (j + tx)];
+                output += mask[i * mask_width + j] * N_ds[(i + ty) * tile_width + (j + tx)];
             }
         }
         if (row_o < h && col_o < w) {
@@ -238,6 +194,8 @@ int main(int argc, char const *argv[]) {
     }
 
     printf("\n\n ----- TILING: \n\n");
+    const int tiling = get_dynamic_tile_width();
+    const int shared_memory_size = tiling * tiling * sizeof(int);
 
     for(block_size= 4; block_size <= 32; block_size *= 2)
     {
@@ -273,7 +231,8 @@ int main(int argc, char const *argv[]) {
 
 
         cudaEventRecord(start, nullptr);
-        convolution_2D_tiled_kernel<<<dimGrid, dimBlock>>>(in, out, mask, mask_size, MATRIX_SIZE, MATRIX_SIZE, get_dynamic_tile_width());
+
+        convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_size, MATRIX_SIZE, MATRIX_SIZE, tiling);
         cudaDeviceSynchronize();
 
         // time counting terminate
