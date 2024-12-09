@@ -1,10 +1,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda.h>
-#include <iostream>
-#include <random>
+#include <fstream>
 
-#define MATRIX_SIZE 5
+#define MATRIX_SIZE 1024
 #define CPU_MATRIX_SIZE 1024
 
 using namespace std;
@@ -91,33 +90,58 @@ int main(int argc, char const *argv[]) {
         printf("Error reading MASK_SIZE env variable; it must be an integer");
         return -1;
     }
-    // reserve size
-    const int mask_boundary = mask_size * mask_size;
-    const int out_boundary = mask_size + MATRIX_SIZE - 1;
-    mask = static_cast<int *>(malloc(sizeof(int) * mask_boundary * mask_boundary));
-    in = static_cast<int *>(malloc(sizeof(int) * matrix_boundary * matrix_boundary));
-    out = static_cast<int *>(malloc(sizeof(int) * out_boundary * out_boundary));
-    // create mask matrix
-    create_mask_matrix(mask, mask_size);
-    // create constant matrix (input)
-    create_constant_matrix(in, MATRIX_SIZE, 1);
-    // initialize output matrix
-    create_constant_matrix(out, out_boundary, 0);
 
-    // debug: print values
-    for (int i = 0; i < mask_boundary; ++i)
-        printf("mask[%d] = %d\n", i, mask[i]);
+    for(block_size= 4; block_size <= 32; block_size *= 2)
+    {
+        // reserve size
+        const int mask_boundary = mask_size * mask_size;
+        const int out_boundary = mask_size + MATRIX_SIZE - 1;
+        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_boundary * mask_boundary);
+        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * MATRIX_SIZE * MATRIX_SIZE);
+        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * out_boundary * out_boundary);
 
-    for (int i = 0; i < MATRIX_SIZE*MATRIX_SIZE; ++i)
-        printf("in[%d] = %d\n", i, in[i]);
+        // create mask matrix
+        // create_mask_matrix(mask, mask_size);
+        create_constant_matrix(mask, mask_size, 3);
+        // create constant matrix (input)
+        create_constant_matrix(in, MATRIX_SIZE, 2);
+        // initialize output matrix
+        create_constant_matrix(out, out_boundary, 0);
 
-    for (int i = 0; i < out_boundary; ++i)
-        printf("out[%d] = %d\n", i, out[i]);
 
-    // free
-    free(mask);
-    free(in);
-    free(out);
+        float  naive_gpu_elapsed_time_ms;
+
+        // some events to count the execution time
+        //clock_t st, end;
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+
+        unsigned int grid_rows = (MATRIX_SIZE + block_size - 1) / block_size;
+        unsigned int grid_cols = (MATRIX_SIZE + block_size - 1) / block_size;
+        dim3 dimGrid(grid_cols, grid_rows);
+        dim3 dimBlock(block_size, block_size);
+
+
+        cudaEventRecord(start, nullptr);
+        convolution_2D_basic_kernel<<<dimGrid, dimBlock>>>(in, mask, out, mask_size, MATRIX_SIZE, MATRIX_SIZE);
+        cudaDeviceSynchronize();
+
+        // time counting terminate
+
+        cudaEventRecord(stop, nullptr);
+        cudaEventSynchronize(stop);
+
+        // compute time elapsed on GPU computing
+        cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
+        printf("Time elapsed on naive GPU matrix multiplication of %dx%d . %dx%d (%d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, MATRIX_SIZE, block_size, naive_gpu_elapsed_time_ms);
+
+        // free memory
+        cudaFree(mask);
+        cudaFree(in);
+        cudaFree(out);
+    }
 
     // retrieve some info about the CUDA device
     cudaGetDeviceCount(nullptr);
