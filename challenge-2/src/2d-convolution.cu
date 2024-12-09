@@ -1,30 +1,45 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <cuda.h>
+#include <cstdio>
 #include <cstdlib>
+#include <cuda.h>
 #include <iostream>
 #include <random>
 
 #define MATRIX_SIZE 8192
 #define CPU_MATRIX_SIZE 1024
 
-__global__ void convolution_global_memory(
-    const float *n, const float *m, float *o, const int width, const int mask_width
+__global__ void convolution_2D_basic_kernel(
+    const unsigned char * in,
+    const unsigned char * mask,
+    unsigned char * out,
+    const int mask_width,
+    const int w,
+    const int h
 ) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (const int row = blockIdx.y * blockDim.y + threadIdx.y; col < w && row < h) {
+        int pixVal = 0;
 
-	float p_value = 0;
+        const int n_start_col = col - (mask_width / 2);
+        const int n_start_row = row - (mask_width / 2);
 
-	const int n_start_point = i-(mask_width/2);
+        // Get the sum of the surrounding box
+        for(int j = 0, cur_row = n_start_row; j < mask_width; ++j, ++cur_row) {
+            const int offset = cur_row * w;
+            const int mask_offset = j * mask_width;
+            for(int k = 0, cur_col = n_start_col; k < mask_width; ++k, ++cur_col) {
+                // Verify we have a valid image pixel
+                if(cur_row > -1 && cur_row < h && cur_col > -1 && cur_col < w) {
+                    pixVal += in[offset + cur_col] * mask[mask_offset + k];
+                }
+            }
+        }
 
-	for(int j = 0; j < mask_width; ++j)
-		if(n_start_point + j >= 0 && n_start_point + j < width)
-			p_value+= n[n_start_point + j] * m[j];
-
-	o[i]=p_value;
+        // Write our new pixel value out
+        out[row * w + col] = static_cast<unsigned char>(pixVal);
+    }
 }
+
 
 __global__ void gpu_matrix_mult(const int *a, const int *b, int *c, const int n) {
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
