@@ -212,55 +212,57 @@ int main(int argc, char const *argv[]) {
 
     printf("\n\n ---------- TILING ---------- \n\n");
     // get dynamic tile
-    const int tiling = get_dynamic_tile_width();
+    // const int tiling = get_dynamic_tile_width();
     // tiling already depends on the block size of the device,
     // so it is not necessary to include it in the for loop
-    const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
+    // const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
 
-    for(block_size= 4; block_size <= 32; block_size *= 2)
-    {
-        // reserve size
-        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
-        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
-        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
+    for (int tiling = 4; tiling <= 32; tiling *= 2) {
+        const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
+        for(block_size= 4; block_size <= 32; block_size *= 2) {
+            // reserve size
+            cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
+            cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
+            cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
 
-        // create mask matrix
-        create_constant_matrix(mask, mask_width, 3);
-        // create constant matrix (input)
-        create_constant_matrix(in, MATRIX_SIZE, 2);
-        // initialize output matrix
-        create_constant_matrix(out, MATRIX_SIZE, 0);
+            // create mask matrix
+            create_constant_matrix(mask, mask_width, 3);
+            // create constant matrix (input)
+            create_constant_matrix(in, MATRIX_SIZE, 2);
+            // initialize output matrix
+            create_constant_matrix(out, MATRIX_SIZE, 0);
 
-        // some events to count the execution time
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
+            // some events to count the execution time
+            cudaEvent_t start, stop;
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
 
-        cudaEventRecord(start, nullptr);
+            cudaEventRecord(start, nullptr);
 
-        dim3 dimBlock(tiling, tiling);
-        dim3 dimGrid((MATRIX_SIZE + tiling - 1) / tiling, (MATRIX_SIZE + tiling - 1) / tiling);
+            dim3 dimBlock(tiling, tiling);
+            dim3 dimGrid((MATRIX_SIZE + tiling - 1) / tiling, (MATRIX_SIZE + tiling - 1) / tiling);
 
-        convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_width, MATRIX_SIZE, MATRIX_SIZE, tiling);
-        cudaDeviceSynchronize();
+            convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_width, MATRIX_SIZE, MATRIX_SIZE, tiling);
+            cudaDeviceSynchronize();
 
-        // time counting terminate
+            // time counting terminate
 
-        cudaEventRecord(stop, nullptr);
-        cudaEventSynchronize(stop);
+            cudaEventRecord(stop, nullptr);
+            cudaEventSynchronize(stop);
 
-        // compute time elapsed on GPU computing
-        cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
+            // compute time elapsed on GPU computing
+            cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
 
-        // debug uncomment:
-        // print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
-        // print result
-        printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, naive_gpu_elapsed_time_ms);
+            // debug uncomment:
+            print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
+            // print result
+            printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d and tiling %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, tiling, naive_gpu_elapsed_time_ms);
 
-        // free memory
-        cudaFree(mask);
-        cudaFree(in);
-        cudaFree(out);
+            // free memory
+            cudaFree(mask);
+            cudaFree(in);
+            cudaFree(out);
+        }
     }
 
     // retrieve some info about the CUDA device
