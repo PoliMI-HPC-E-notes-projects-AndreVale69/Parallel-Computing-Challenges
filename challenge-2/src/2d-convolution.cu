@@ -7,6 +7,15 @@
 
 using namespace std;
 
+/**
+ * Naive 2D convolution kernel (no tiling).
+ * @param in Input matrix.
+ * @param mask Mask matrix.
+ * @param out Output matrix.
+ * @param mask_width Width of the mask matrix.
+ * @param w Width of the input matrix.
+ * @param h Height of the input matrix.
+ */
 __global__ void convolution_2D_basic_kernel(
     const int * in,
     const int * mask,
@@ -21,7 +30,6 @@ __global__ void convolution_2D_basic_kernel(
         const int n_start_col = col - mask_width_half;
         const int n_start_row = row - mask_width_half;
         int pixVal = 0;
-
         for(int j = 0; j < mask_width; ++j){
             const int curr_row = n_start_row + j;
             for(int k = 0; k < mask_width; ++k){
