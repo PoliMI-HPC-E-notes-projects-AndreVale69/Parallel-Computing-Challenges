@@ -34,6 +34,48 @@ __global__ void convolution_2d(int* input, int* output, int height, int width, i
 }
 
 
+//tiled version:
+__global__ void convolution_2d_tiled(int* input, int* output, int height, int width, int* mask, int mask_dim, int block_size) {
+    extern __shared__ int shared_mem[];
+
+    int mask_radius = mask_dim / 2;
+    int shared_width = block_size + 2 * mask_radius;
+
+    int thread_col = threadIdx.x;
+    int thread_row = threadIdx.y;
+
+    int col = blockIdx.x * block_size + thread_col - mask_radius;
+    int row = blockIdx.y * block_size + thread_row - mask_radius;
+
+    // Load data into shared memory with boundary checks
+    if (row >= 0 && row < height && col >= 0 && col < width) {
+        shared_mem[thread_row * shared_width + thread_col] = input[row * width + col];
+    } else {
+        shared_mem[thread_row * shared_width + thread_col] = 0;
+    }
+
+    __syncthreads();
+
+    // Compute convolution for threads within valid block range
+    col = blockIdx.x * block_size + threadIdx.x;
+    row = blockIdx.y * block_size + threadIdx.y;
+
+    if (threadIdx.x >= mask_radius && threadIdx.x < block_size + mask_radius &&
+        threadIdx.y >= mask_radius && threadIdx.y < block_size + mask_radius &&
+        col < width && row < height) {
+
+        int result = 0;
+        for (int i = 0; i < mask_dim; i++) {
+            for (int j = 0; j < mask_dim; j++) {
+                result += shared_mem[(threadIdx.y - mask_radius + i) * shared_width + (threadIdx.x - mask_radius + j)] *
+                          mask[i * mask_dim + j];
+            }
+        }
+        output[row * width + col] = result;
+    }
+}
+
+
 // Funzione per la convoluzione 2D sulla CPU
 void convolution_2d_cpu(int *matrix, int *result, int height, int width, int *mask, int mask_dim) {
     int mask_offset = mask_dim / 2;
@@ -112,6 +154,7 @@ int main(int argc, char* argv[]) {
     int height = std::atoi(argv[1]);
     int width = std::atoi(argv[2]);
     int mask_dim = std::atoi(argv[3]);
+     int block_size = 16;
 
     if (height <= 0 || width <= 0 || mask_dim <= 0 || mask_dim % 2 == 0) {
         std::cerr << "Error: Dimensions must be positive and mask_dim must be odd.\n";
@@ -146,8 +189,30 @@ int main(int argc, char* argv[]) {
     auto end_no_tiling = std::chrono::high_resolution_clock::now();
 
     check_cuda_error(cudaMemcpy(h_output, d_output, matrix_size, cudaMemcpyDeviceToHost), "cudaMemcpy h_output");
+
+
+    //tiled version
+    int *d_output_tiled;
+     int* h_output_tiled = new int[height * width];
+    check_cuda_error(cudaMalloc(&d_output_tiled, matrix_size), "cudaMalloc d_output");
+     size_t shared_mem_size = (block_size + 2 * (mask_dim / 2)) * (block_size + 2 * (mask_dim / 2)) * sizeof(int);
+     auto start_tiled = std::chrono::high_resolution_clock::now();
+    convolution_2d_tiled<<<grid_dim, block_dim, shared_mem_size>>>(d_input, d_output_tiled, height, width, d_mask, mask_dim, block_size);
+    check_cuda_error(cudaDeviceSynchronize(), "Kernel execution");
+    auto end_tiled = std::chrono::high_resolution_clock::now();
+    check_cuda_error(cudaMemcpy(h_output_tiled, d_output, matrix_size, cudaMemcpyDeviceToHost), "cudaMemcpy h_output");
+    verify_result(h_input, h_mask, h_output_tiled, height, width, mask_dim);
+     std::cout << " ------ TILED ----- VERIFY COMPLETED SUCCESSFULLY!\n";
+    // print_matrix(h_output_tiled, height, width, "TILED - result on d2conv on GPU");
+
+
+
+
+
+
+
     verify_result(h_input, h_mask, h_output, height, width, mask_dim);
-     std::cout << "VERIFY COMPLETED SUCCESSFULLY!\n";
+     std::cout << "(no tiled)VERIFY COMPLETED SUCCESSFULLY!\n";
     //std::cout << "Output Matrix:\n";
     //for (int i = 0; i < height; i++) {
        // for (int j = 0; j < width; j++) {
@@ -155,7 +220,7 @@ int main(int argc, char* argv[]) {
        // }
         //std::cout << "\n";
     //}
-    //print_matrix(h_output, height, width, "result on d2conv on GPU");
+   // print_matrix(h_output, height, width, "result on d2conv on GPU");
 
       // CPU version
     int* result_cpu = new int[height * width];
@@ -165,6 +230,11 @@ int main(int argc, char* argv[]) {
    // print_matrix(result_cpu, height, width, "result on 2dconv on CPU");
 
 
+
+ // Print timings
+    std::cout << "Time (GPU Tiled): "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_tiled - start_tiled).count()
+              << " ms\n";
 
  std::cout << "Time (GPU No Tiling): "
               << std::chrono::duration_cast<std::chrono::milliseconds>(end_no_tiling - start_no_tiling).count()
