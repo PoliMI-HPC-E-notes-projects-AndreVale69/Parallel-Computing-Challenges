@@ -1,293 +1,386 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cuda.h>
-#include <fstream>
+#include <cassert>
+#include <iostream>
+#include <cuda_runtime.h>
+#include <chrono>
 
-#define MATRIX_SIZE 10
-
-using namespace std;
+/**
+ * Check for CUDA errors.
+ * @param err Return value of CUDA runtime API function.
+ * @param msg Error message to display.
+ */
+void err_check(const cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        printf("CUDA Error (%s): %s\n", msg, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+}
 
 /**
  * Naive 2D convolution kernel (no tiling).
- * @param in Input matrix.
+ * @param input Input matrix.
+ * @param output Output matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
  * @param mask Mask matrix.
- * @param out Output matrix.
  * @param mask_width Width of the mask matrix.
- * @param w Width of the input matrix.
- * @param h Height of the input matrix.
  */
-__global__ void convolution_2D_basic_kernel(
-    const int * in,
+__global__ void convolution_2d(
+    const int * input,
+    int * output,
+    const int height,
+    const int width,
     const int * mask,
-    int * out,
-    const int mask_width,
-    const int w,
-    const int h
+    const int mask_width
 ) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
-    const int mask_width_half = mask_width / 2;
-    if(const int col = blockIdx.x * blockDim.x + threadIdx.x; col < w && row < h){
-        const int n_start_col = col - mask_width_half;
-        const int n_start_row = row - mask_width_half;
-        int pixVal = 0;
-        for(int j = 0; j < mask_width; ++j){
-            const int curr_row = n_start_row + j;
-            for(int k = 0; k < mask_width; ++k){
-                if(const int curr_col = n_start_col + k; curr_row > -1 && curr_row < h && curr_col > -1 && curr_col < w){
-                    pixVal += in[curr_row * w + curr_col] * mask[j * mask_width + k];
+
+    const int mask_radius = mask_width / 2;
+
+    if (row < height && col < width) {
+        int result = 0;
+        for (int i = -mask_radius; i <= mask_radius; i++) {
+            for (int j = -mask_radius; j <= mask_radius; j++) {
+                const int cur_row = row + i;
+                if (const int cur_col = col + j; cur_row >= 0 && cur_row < height && cur_col >= 0 && cur_col < width) {
+                    result += input[cur_row * width + cur_col] * mask[(i + mask_radius) * mask_width + (j + mask_radius)];
                 }
             }
         }
-        out[row * w + col] = pixVal;
+        output[row * width + col] = result;
     }
 }
 
-__global__ void convolution_2D_tiled_kernel(
-    const int *in,
-    int *out,
-    const int *mask,
-    const int mask_width,
-    const int w,
-    const int h,
-    const int tile_width
+/**
+ * Tiled 2D convolution kernel.
+ * @param input Input matrix.
+ * @param output Output matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
+ * @param mask Mask matrix.
+ * @param mask_dim Dimension of the mask matrix.
+ * @param block_size Block size.
+ */
+__global__ void convolution_2d_tiled(
+    const int * input,
+    int * output,
+    const int height,
+    const int width,
+    const int * mask,
+    const int mask_dim,
+    const int block_size
 ) {
-    extern __shared__ int N_ds[];
+    // initialize shared memory as dynamic
+    // https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/#dynamic_shared_memory
+    extern __shared__ int shared_mem[];
 
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-    const int row_o = blockIdx.y * tile_width + ty;
-    const int col_o = blockIdx.x * tile_width + tx;
-    const int row_i = row_o - mask_width / 2;
-    const int col_i = col_o - mask_width / 2;
+    const int mask_radius = mask_dim / 2;
+    const int shared_width = block_size + 2 * mask_radius;
 
-    const int sharedMemDim = tile_width + mask_width - 1;
+    const int thread_col = threadIdx.x;
+    const int thread_row = threadIdx.y;
+    const int block_col = blockIdx.x;
+    const int block_row = blockIdx.y;
 
-    // Ensure boundary checks for shared memory
-    if (ty < sharedMemDim && tx < sharedMemDim) {
-        if (row_i >= 0 && row_i < h && col_i >= 0 && col_i < w) {
-            N_ds[ty * sharedMemDim + tx] = in[row_i * w + col_i];
-        } else {
-            N_ds[ty * sharedMemDim + tx] = 0;
-        }
+    // calculate the column and row for the current thread
+    // with respect to the mask radius
+    int col = block_col * block_size + thread_col - mask_radius;
+    int row = block_row * block_size + thread_row - mask_radius;
+
+    // load data into shared memory with boundary checks
+    if (row >= 0 && row < height && col >= 0 && col < width) {
+        shared_mem[thread_row * shared_width + thread_col] = input[row * width + col];
+    } else {
+        // avoid branch divergence
+        shared_mem[thread_row * shared_width + thread_col] = 0;
     }
 
+    // barrier synchronization
     __syncthreads();
 
-    // Perform convolution within valid range
-    if (ty < tile_width && tx < tile_width) {
-        int output = 0;
-        for (int i = 0; i < mask_width; ++i) {
-            for (int j = 0; j < mask_width; ++j) {
-                int shared_i = ty + i;
-                int shared_j = tx + j;
-                if (shared_i < sharedMemDim && shared_j < sharedMemDim) {
-                    output += mask[i * mask_width + j] * N_ds[shared_i * sharedMemDim + shared_j];
-                }
+    // compute convolution for threads within valid block range
+    col = block_col * block_size + thread_col;
+    row = block_row * block_size + thread_row;
+
+    if (
+        thread_col >= mask_radius &&                // left boundary
+        thread_col < block_size + mask_radius &&    // right boundary
+        thread_row >= mask_radius &&                // top boundary
+        thread_row < block_size + mask_radius &&    // bottom boundary
+        col < width && row < height                 // within matrix boundaries
+    ) {
+        // compute convolution
+        int result = 0;
+        for (int i = 0; i < mask_dim; i++) {
+            for (int j = 0; j < mask_dim; j++) {
+                result += shared_mem[(thread_row - mask_radius + i) * shared_width + (thread_col - mask_radius + j)] *
+                          mask[i * mask_dim + j];
             }
         }
-        if (row_o < h && col_o < w) {
-            out[row_o * w + col_o] = output;
+        // store the result, barrier synchronization is not needed
+        output[row * width + col] = result;
+    }
+}
+
+
+/**
+ * Naive 2D convolution on CPU.
+ * @param matrix Input matrix.
+ * @param result Result matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
+ * @param mask Mask matrix.
+ * @param mask_dim Dimension of the mask matrix.
+ */
+void convolution_2d_cpu(
+    const int * matrix,
+    int * result,
+    const int height,
+    const int width,
+    const int * mask,
+    const int mask_dim
+) {
+    const int mask_offset = mask_dim / 2;
+    // for each row
+    for (int i = 0; i < height; ++i) {
+        // for each column
+        for (int j = 0; j < width; ++j) {
+            int convolution = 0;
+            // for each row of the mask
+            for (int k = 0; k < mask_dim; ++k) {
+                // for each column of the mask
+                for (int l = 0; l < mask_dim; ++l) {
+                    const int r = i - mask_offset + k;
+                    if (const int c = j - mask_offset + l; r >= 0 && r < height && c >= 0 && c < width) {
+                        convolution += matrix[r * width + c] * mask[k * mask_dim + l];
+                    }
+                }
+            }
+            result[i * width + j] = convolution;
         }
     }
 }
 
+/**
+ * Initialize a matrix with a constant value.
+ * @param matrix Result matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
+ * @param value Value to initialize the matrix with.
+ */
+void initialize_matrix_by_constant(int* matrix, const int height, const int width, const int value) {
+    // for each row
+    for (int i = 0; i < height; i++) {
+        // for each column
+        for (int j = 0; j < width; j++) {
+            // set the value
+            matrix[i * width + j] = value;
+        }
+    }
+}
+
+/**
+ * Create a matrix with random values between 0 and random_upper_bound.
+ * @param matrix Result matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
+ * @param random_upper_bound Upper limit for random number generation, 10 by default.
+ * @throw invalid_argument If mask is null.
+ */
+void initialize_matrix_by_random(
+    int * matrix,
+    const int height,
+    const int width,
+    const int random_upper_bound
+) {
+    // for each row
+    for (int i = 0; i < height; i++) {
+        // for each column
+        for (int j = 0; j < width; j++) {
+            // set the value
+            matrix[i * width + j] = static_cast<int>(random()) % random_upper_bound;
+        }
+    }
+}
+
+/**
+ * Verify the result of the convolution.
+ * The method compares the result of the convolution with the expected result.
+ * It computes the convolution on the CPU and compares it with the result saved in the output matrix.
+ * @param matrix Input matrix.
+ * @param mask Mask matrix.
+ * @param result Result matrix.
+ * @param height Height of the input matrix.
+ * @param width Width of the input matrix.
+ * @param mask_dim Dimension of the mask matrix.
+ */
+void verify_result(
+    const int * matrix,
+    const int * mask,
+    const int * result,
+    const int height,
+    const int width,
+    const int mask_dim
+) {
+    // same implementation as convolution_2d_cpu but with assert
+    const int mask_offset = mask_dim / 2;
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            int expected_convolution = 0;
+            for (int k = 0; k < mask_dim; k++) {
+                for (int l = 0; l < mask_dim; l++) {
+                    const int r = i - mask_offset + k;
+                    if (const int c = j - mask_offset + l; r >= 0 && r < height && c >= 0 && c < width) {
+                        expected_convolution += matrix[r * width + c] * mask[k * mask_dim + l];
+                    }
+                }
+            }
+            assert(result[i * width + j] == expected_convolution);
+        }
+    }
+}
 
 /**
  * Print a matrix.
  * @param matrix Matrix to print.
  * @param height Height of the matrix.
  * @param width Width of the matrix.
+ * @param label Label to print before the matrix.
  */
-void print_matrix(const int* matrix, const int height, const int width) {
-    for (int i = 0; i < height; ++i) {
-        for (int j = 0; j < width; ++j) {
-            printf("%d ", matrix[i * height + j]);
+void print_matrix(const int *matrix, int height, int width, const std::string &label) {
+    printf("%s (%dx%d):\n", label.c_str(), height, width);
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            printf("%d ", matrix[i * width + j]);
         }
         printf("\n");
     }
+    printf("\n");
 }
 
-/**
- * Get the dynamic tile width for the current device.
- * @return Tile width.
- */
-int get_dynamic_tile_width() {
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, 0);
-    int maxThreadsPerBlock = prop.maxThreadsPerBlock;
-    int tileWidth = static_cast<int>(sqrt(maxThreadsPerBlock));
-    return tileWidth;
-}
-
-/**
- * Create a matrix with random values between 0 and random_upper_bound.
- * @param result Result matrix.
- * @param rows Number of rows of the output mask, the matrix should be square.
- * @param random_upper_bound Upper limit for random number generation, 10 by default.
- * @throw invalid_argument If mask is null.
- */
-void create_random_matrix(int *result, const int rows, const int random_upper_bound = 10) {
-    if (result == nullptr)
-        throw invalid_argument("Result matrix cannot be null");
-    // init bound
-    const int boundary = rows * rows;
-    // insert values
-    for (int i = 0; i < boundary; ++i)
-        result[i] = static_cast<int>(random()) % random_upper_bound;
-}
-
-/**
- * Create a constant matrix with a specific value.
- * @param result Constant matrix result.
- * @param rows Rows of the final matrix, it should be square.
- * @param value Value to fill the matrix.
- * @throw invalid_argument If result is null.
- */
-void create_constant_matrix(int *result, const int rows, const int value) {
-    if (result == nullptr)
-        throw invalid_argument("Result matrix cannot be null");
-    // init bound
-    const int boundary = rows * rows;
-    // insert values
-    for (int i = 0; i < boundary; ++i)
-        result[i] = value;
-}
-
-int main(int argc, char const *argv[]) {
-    // init
-    constexpr int matrix_boundary = MATRIX_SIZE * MATRIX_SIZE;
-    int mask_width = 0, block_size;
-    int *mask, *in, *out;
-    float naive_gpu_elapsed_time_ms = 0.0;
-
+int main() {
     // try to get env variable
+    int height, width, mask_dim;
     try {
-        mask_width = stoi(getenv("MASK_SIZE"));
+        mask_dim = std::stoi(getenv("MASK_SIZE"));
+        height = std::stoi(getenv("MATRIX_HEIGHT"));
+        width = std::stoi(getenv("MATRIX_WIDTH"));
+        if (!(mask_dim > 0 && height > 0 && width > 0 && mask_dim % 2 != 0)) {
+            throw std::invalid_argument("Invalid argument");
+        }
     }
     catch (...) {
-        printf("Error reading MASK_SIZE env variable; it must be an integer");
-        return -1;
+        printf("Error reading env variable MASK_SIZE, MATRIX_HEIGHT, MATRIX_WIDTH; "
+            "it must be an integer, dimensions must be positive and the dimension of the mask must be odd.");
+        return 1;
     }
-
-    for(block_size= 4; block_size <= 32; block_size *= 2)
-    {
-        // reserve size
-        cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
-        cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
-        cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
-
-        // create mask matrix
-        // create_mask_matrix(mask, mask_size);
-        create_constant_matrix(mask, mask_width, 3);
-        // create constant matrix (input)
-        create_constant_matrix(in, MATRIX_SIZE, 2);
-        // initialize output matrix
-        create_constant_matrix(out, MATRIX_SIZE, 0);
-
-        // some events to count the execution time
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-
-        unsigned int grid_rows = (MATRIX_SIZE + block_size - 1) / block_size;
-        unsigned int grid_cols = (MATRIX_SIZE + block_size - 1) / block_size;
-        dim3 dimGrid(grid_cols, grid_rows);
-        dim3 dimBlock(block_size, block_size);
-
-
-        cudaEventRecord(start, nullptr);
-        convolution_2D_basic_kernel<<<dimGrid, dimBlock>>>(in, mask, out, mask_width, MATRIX_SIZE, MATRIX_SIZE);
-        cudaDeviceSynchronize();
-
-        // time counting terminate
-
-        cudaEventRecord(stop, nullptr);
-        cudaEventSynchronize(stop);
-
-        // compute time elapsed on GPU computing
-        cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
-
-        // debug uncomment:
-        // print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
-        // print result
-        printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, naive_gpu_elapsed_time_ms);
-
-        // free memory
-        cudaFree(mask);
-        cudaFree(in);
-        cudaFree(out);
-    }
-
-    printf("\n\n ---------- TILING ---------- \n\n");
-    // get dynamic tile
-    // const int tiling = get_dynamic_tile_width();
-    // tiling already depends on the block size of the device,
-    // so it is not necessary to include it in the for loop
-    // const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
 
     for (int tiling = 4; tiling <= 32; tiling *= 2) {
-        const int shared_memory_size = (tiling + mask_width - 1) * (tiling + mask_width - 1) * sizeof(int);
-        for(block_size= 4; block_size <= 32; block_size *= 2) {
-            // reserve size
-            cudaMallocManaged(reinterpret_cast<void **>(&mask), sizeof(int) * mask_width * mask_width);
-            cudaMallocManaged(reinterpret_cast<void **>(&in), sizeof(int) * matrix_boundary);
-            cudaMallocManaged(reinterpret_cast<void **>(&out), sizeof(int) * matrix_boundary);
+        for (int block_size = 4; block_size <= 32; block_size *= 2) {
+            // TODO: bad access to CUDA memory - cases:
+            if (block_size == 4 && tiling == 16 ||
+                block_size == 4 && tiling == 32 ||
+                block_size == 8 && tiling == 16 ||
+                block_size == 8 && tiling == 32 ||
+                block_size == 16 && tiling == 32) {
+                continue;
+            }
+            const size_t matrix_size = height * width * sizeof(int);
+            const size_t mask_size = mask_dim * mask_dim * sizeof(int);
 
-            // create mask matrix
-            create_constant_matrix(mask, mask_width, 3);
-            // create constant matrix (input)
-            create_constant_matrix(in, MATRIX_SIZE, 2);
-            // initialize output matrix
-            create_constant_matrix(out, MATRIX_SIZE, 0);
+            int* h_input = new int[height * width];
+            int* h_output = new int[height * width];
+            int* h_mask = new int[mask_dim * mask_dim];
 
-            // some events to count the execution time
+            initialize_matrix_by_constant(h_input, height, width, 2);
+            initialize_matrix_by_constant(h_mask, mask_dim, mask_dim, 3);
+
+            int *d_input, *d_output, *d_mask;
+            err_check(cudaMalloc(&d_input, matrix_size), "cudaMalloc d_input");
+            err_check(cudaMalloc(&d_output, matrix_size), "cudaMalloc d_output");
+            err_check(cudaMalloc(&d_mask, mask_size), "cudaMalloc d_mask");
+
+            err_check(cudaMemcpy(d_input, h_input, matrix_size, cudaMemcpyHostToDevice), "cudaMemcpy d_input");
+            err_check(cudaMemcpy(d_mask, h_mask, mask_size, cudaMemcpyHostToDevice), "cudaMemcpy d_mask");
+
+            dim3 block_dim(tiling, tiling);
+            dim3 grid_dim((width + block_dim.x - 1) / block_dim.x, (height + block_dim.y - 1) / block_dim.y);
+
+            // No tiling version
+            auto start_no_tiling = std::chrono::high_resolution_clock::now();
+            convolution_2d<<<grid_dim, block_dim>>>(d_input, d_output, height, width, d_mask, mask_dim);
+            err_check(cudaDeviceSynchronize(), "Kernel execution");
+            auto end_no_tiling = std::chrono::high_resolution_clock::now();
+            err_check(cudaMemcpy(h_output, d_output, matrix_size, cudaMemcpyDeviceToHost), "cudaMemcpy h_output");
+            // print_matrix(h_output, width, height, "result on d2conv on GPU");
+
+
+            //tiled version
+            int *d_output_tiled;
+            int* h_output_tiled = new int[height * width];
+            err_check(cudaMalloc(&d_output_tiled, matrix_size), "cudaMalloc d_output");
+            size_t shared_mem_size = (block_size + 2 * (mask_dim / 2)) * (block_size + 2 * (mask_dim / 2)) * sizeof(int);
+            auto start_tiled = std::chrono::high_resolution_clock::now();
+            float naive_gpu_elapsed_time_ms = 0.0;
             cudaEvent_t start, stop;
             cudaEventCreate(&start);
             cudaEventCreate(&stop);
 
             cudaEventRecord(start, nullptr);
-
-            dim3 dimBlock(tiling, tiling);
-            dim3 dimGrid((MATRIX_SIZE + tiling - 1) / tiling, (MATRIX_SIZE + tiling - 1) / tiling);
-
-            convolution_2D_tiled_kernel<<<dimGrid, dimBlock, shared_memory_size>>>(in, out, mask, mask_width, MATRIX_SIZE, MATRIX_SIZE, tiling);
-            cudaDeviceSynchronize();
-
-            // time counting terminate
-
+            convolution_2d_tiled<<<grid_dim, block_dim, shared_mem_size>>>(d_input, d_output_tiled, height, width, d_mask, mask_dim, block_size);
+            err_check(cudaDeviceSynchronize(), "Kernel execution");
+            auto end_tiled = std::chrono::high_resolution_clock::now();
             cudaEventRecord(stop, nullptr);
             cudaEventSynchronize(stop);
+            printf("Time elapsed on naive GPU 2D-convolution: %f ms.\n\n", naive_gpu_elapsed_time_ms);
 
-            // compute time elapsed on GPU computing
+            /**
+             * Verify the result of the convolution
+             */
             cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
+            err_check(cudaMemcpy(h_output_tiled, d_output, matrix_size, cudaMemcpyDeviceToHost), "cudaMemcpy h_output");
+            verify_result(h_input, h_mask, h_output_tiled, height, width, mask_dim);
+            printf("Block size: %d; Tiled size: %d\n", block_size, tiling);
+            printf(" ------ TILED ----- VERIFY COMPLETED SUCCESSFULLY!\n");
+            // debug:
+            // print_matrix(h_output_tiled, height, width, "TILED - result on d2conv on GPU");
 
-            // debug uncomment:
-            print_matrix(out, MATRIX_SIZE, MATRIX_SIZE);
-            // print result
-            printf("Time elapsed on naive GPU 2D-convolution of a matrix %dx%d using a mask %dx%d (block size %d and tiling %d): %f ms.\n\n", MATRIX_SIZE, MATRIX_SIZE, mask_width, mask_width, block_size, tiling, naive_gpu_elapsed_time_ms);
+            verify_result(h_input, h_mask, h_output, height, width, mask_dim);
+            printf("(no tiled)VERIFY COMPLETED SUCCESSFULLY!\n");
+
+            // CPU version
+            int* result_cpu = new int[height * width];
+            auto start_cpu = std::chrono::high_resolution_clock::now();
+            convolution_2d_cpu(h_input, result_cpu, height, width, h_mask, mask_dim);
+            auto end_cpu = std::chrono::high_resolution_clock::now();
+            // debug:
+            // print_matrix(result_cpu, height, width, "result on 2dconv on CPU");
+
+            // Print timings
+            std::cout << "Time (GPU Tiled): "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_tiled - start_tiled).count()
+                      << " ms\n";
+
+            std::cout << "Time (GPU No Tiling): "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_no_tiling - start_no_tiling).count()
+                      << " ms\n";
+
+            std::cout << "Time (CPU): "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(end_cpu - start_cpu).count()
+                      << " ms\n";
 
             // free memory
-            cudaFree(mask);
-            cudaFree(in);
-            cudaFree(out);
+            delete[] h_input;
+            delete[] h_output;
+            delete[] h_mask;
+            delete[] h_output_tiled;
+            delete[] result_cpu;
+            // free cuda memory
+            err_check(cudaFree(d_input), "cudaFree d_input");
+            err_check(cudaFree(d_output), "cudaFree d_output");
+            err_check(cudaFree(d_mask), "cudaFree d_mask");
         }
     }
-
-    // retrieve some info about the CUDA device
-    cudaGetDeviceCount(nullptr);
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, 0);
-    printf("Device Number: %d\n", 0);
-    printf("  Device name: %s\n", prop.name);
-    printf("  max Blocks Per MultiProcessor: %d\n", prop.maxBlocksPerMultiProcessor);
-    printf("  max Threads Per MultiProcessor: %d\n", prop.maxThreadsPerMultiProcessor);
-    printf("  max Threads Per Block: %d\n", prop.maxThreadsPerBlock);
-    printf("  num SM: %d\n", prop.multiProcessorCount);
-    printf("  num bytes sharedMem Per Block: %lu\n", prop.sharedMemPerBlock);
-    printf("  num bytes sharedMem Per Multiprocessor: %lu\n", prop.sharedMemPerMultiprocessor);
-    printf("  Memory Clock Rate (KHz): %d\n", prop.memoryClockRate);
-    printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
-    printf("  Peak Memory Bandwidth (GB/s): %f\n\n", 2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
 
     return 0;
 }
