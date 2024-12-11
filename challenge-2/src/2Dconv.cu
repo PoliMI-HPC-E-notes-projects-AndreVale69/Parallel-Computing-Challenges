@@ -1,81 +1,75 @@
 #include <cassert>
-#include <cstdlib>
 #include <iostream>
 #include <cuda_runtime.h>
+#include <chrono>
+void check_cuda_error(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA Error (" << msg << "): " << cudaGetErrorString(err) << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
 
-// Kernel per la convoluzione 2D con tiling
-__global__ void convolution_2d_tiled(int *matrix, int *result, int height, int width, int *mask, int mask_dim) {
-    int mask_offset = mask_dim / 2;
+__global__ void convolution_2d(int* input, int* output, int height, int width, int* mask, int mask_dim) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Calcola posizione globale del thread
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int mask_radius = mask_dim / 2;
 
-    // Dimensione della memoria condivisa (tile + bordi)
-    extern __shared__ int shared_matrix[];
-    int shared_dim_x = blockDim.x + mask_dim - 1;
-    int shared_dim_y = blockDim.y + mask_dim - 1;
-
-    // Posizioni locali
-    int local_row = threadIdx.y;
-    int local_col = threadIdx.x;
-    int shared_row = local_row + mask_offset;
-    int shared_col = local_col + mask_offset;
-
-    // Copia i dati in memoria condivisa con gestione dei bordi
     if (row < height && col < width) {
-        shared_matrix[shared_row * shared_dim_x + shared_col] = matrix[row * width + col];
-    } else {
-        shared_matrix[shared_row * shared_dim_x + shared_col] = 0;
-    }
+        int result = 0;
 
-    if (local_row < mask_offset && row >= mask_offset) {
-        shared_matrix[(shared_row - mask_offset) * shared_dim_x + shared_col] = matrix[(row - mask_offset) * width + col];
-    }
-    if (local_row >= blockDim.y - mask_offset && row < height - mask_offset) {
-        shared_matrix[(shared_row + mask_offset) * shared_dim_x + shared_col] = matrix[(row + mask_offset) * width + col];
-    }
+        for (int i = -mask_radius; i <= mask_radius; i++) {
+            for (int j = -mask_radius; j <= mask_radius; j++) {
+                int cur_row = row + i;
+                int cur_col = col + j;
 
-    if (local_col < mask_offset && col >= mask_offset) {
-        shared_matrix[shared_row * shared_dim_x + (shared_col - mask_offset)] = matrix[row * width + (col - mask_offset)];
-    }
-    if (local_col >= blockDim.x - mask_offset && col < width - mask_offset) {
-        shared_matrix[shared_row * shared_dim_x + (shared_col + mask_offset)] = matrix[row * width + (col + mask_offset)];
-    }
-
-    __syncthreads();
-
-    // Esegui la convoluzione
-    int temp = 0;
-    if (row < height && col < width) {
-        for (int i = 0; i < mask_dim; i++) {
-            for (int j = 0; j < mask_dim; j++) {
-                temp += shared_matrix[(shared_row - mask_offset + i) * shared_dim_x +
-                                      (shared_col - mask_offset + j)] *
-                        mask[i * mask_dim + j];
+                if (cur_row >= 0 && cur_row < height && cur_col >= 0 && cur_col < width) {
+                    result += input[cur_row * width + cur_col] * mask[(i + mask_radius) * mask_dim + (j + mask_radius)];
+                }
             }
         }
-        result[row * width + col] = temp;
+
+        output[row * width + col] = result;
     }
 }
 
-// Funzione per inizializzare una matrice
-void init_matrix(int *m, int rows, int cols) {
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            m[i * cols + j] = rand() % 10;
+
+// Funzione per la convoluzione 2D sulla CPU
+void convolution_2d_cpu(int *matrix, int *result, int height, int width, int *mask, int mask_dim) {
+    int mask_offset = mask_dim / 2;
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            int temp = 0;
+            for (int k = 0; k < mask_dim; k++) {
+                for (int l = 0; l < mask_dim; l++) {
+                    int r = i - mask_offset + k;
+                    int c = j - mask_offset + l;
+                    if (r >= 0 && r < height && c >= 0 && c < width) {
+                        temp += matrix[r * width + c] * mask[k * mask_dim + l];
+                    }
+                }
+            }
+            result[i * width + j] = temp;
         }
     }
 }
 
-// Funzione per inizializzare una matrice (constante)
-void init_matrix_constant(int *m, int rows, int cols, int constant) {
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
-            m[i * cols + j] = constant;
+void initialize_matrix(int* matrix, int height, int width, int value) {
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            matrix[i * width + j] = value;
         }
     }
 }
+
+void initialize_mask(int* mask, int mask_dim, int value) {
+    for (int i = 0; i < mask_dim; i++) {
+        for (int j = 0; j < mask_dim; j++) {
+            mask[i * mask_dim + j] = value;
+        }
+    }
+}
+
 
 // Funzione per verificare il risultato
 void verify_result(int *matrix, int *mask, int *result, int height, int width, int mask_dim) {
@@ -97,71 +91,7 @@ void verify_result(int *matrix, int *mask, int *result, int height, int width, i
     }
 }
 
-// Funzione per scegliere dinamicamente blocchi e griglie
-//versione precedente
-/*void choose_optimal_tile_and_block(int &block_size, int &shared_memory_size, int mask_dim) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-
-    // Massimo numero di thread per blocco
-    int max_threads_per_block = prop.maxThreadsPerBlock;
-
-    // Calcola dimensioni ottimali (quadrato vicino alla radice di max_threads_per_block)
-    int optimal_block_size = sqrt(max_threads_per_block);
-    block_size = optimal_block_size;
-
-    // Dimensione della memoria condivisa (in base alla dimensione della maschera)
-    shared_memory_size = (block_size + mask_dim - 1) * (block_size + mask_dim - 1) * sizeof(int);
-}*/
-
-void choose_optimal_tile_and_block(int &block_size, int &shared_memory_size, int mask_dim) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-
-    // Massimo numero di thread per blocco e per SM
-    int max_threads_per_block = prop.maxThreadsPerBlock;
-    int max_threads_per_sm = prop.maxThreadsPerMultiProcessor;
-
-    // Numero massimo di blocchi per SM
-    int max_blocks_per_sm = prop.maxBlocksPerMultiProcessor;
-
-    // Memoria condivisa massima per blocco
-    int max_shared_memory = prop.sharedMemPerBlock;
-
-    // Calcola dimensioni ottimali (quadrato vicino alla radice di max_threads_per_block)
-    int optimal_block_size = sqrt(max_threads_per_block);
-
-    // Stima iniziale della memoria condivisa richiesta
-    int required_shared_memory = (optimal_block_size + mask_dim - 1) * (optimal_block_size + mask_dim - 1) * sizeof(int);
-
-    // Riduci il blocco se la memoria condivisa richiesta eccede quella disponibile
-    while (required_shared_memory > max_shared_memory && optimal_block_size > 1) {
-        optimal_block_size--;
-        required_shared_memory = (optimal_block_size + mask_dim - 1) * (optimal_block_size + mask_dim - 1) * sizeof(int);
-    }
-
-    // Calcola il numero massimo di thread per blocco in base ai limiti di SM
-    int max_threads_per_tile = max_threads_per_sm / max_blocks_per_sm;
-
-    // Riduci il blocco se i thread per blocco eccedono i limiti del SM
-    while ((optimal_block_size * optimal_block_size) > max_threads_per_tile && optimal_block_size > 1) {
-        optimal_block_size--;
-    }
-
-    // Assegna le dimensioni finali
-    block_size = optimal_block_size;
-    shared_memory_size = (block_size + mask_dim - 1) * (block_size + mask_dim - 1) * sizeof(int);
-
-    // Stampa informazioni utili per il debug
-    std::cout << "Optimal block size: " << block_size << "x" << block_size << std::endl;
-    std::cout << "Shared memory per block: " << shared_memory_size << " bytes" << std::endl;
-    std::cout << "Threads per block: " << block_size * block_size << std::endl;
-    std::cout << "Max threads per SM: " << max_threads_per_sm << std::endl;
-    std::cout << "Max blocks per SM: " << max_blocks_per_sm << std::endl;
-}
-
-
-// Funzione per stampare una matrice
+// print a matrix
 void print_matrix(const int *matrix, int rows, int cols, const std::string &label) {
     std::cout << label << " (" << rows << "x" << cols << "):" << std::endl;
     for (int i = 0; i < rows; i++) {
@@ -173,63 +103,84 @@ void print_matrix(const int *matrix, int rows, int cols, const std::string &labe
     std::cout << std::endl;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char* argv[]) {
     if (argc != 4) {
         std::cerr << "Usage: " << argv[0] << " <matrix_height> <matrix_width> <mask_dim>\n";
         return 1;
     }
 
-    int height = std::atoi(argv[1]);     // Altezza della matrice
-    int width = std::atoi(argv[2]);      // Larghezza della matrice
-    int mask_dim = std::atoi(argv[3]);   // Dimensione della maschera
+    int height = std::atoi(argv[1]);
+    int width = std::atoi(argv[2]);
+    int mask_dim = std::atoi(argv[3]);
+
+    if (height <= 0 || width <= 0 || mask_dim <= 0 || mask_dim % 2 == 0) {
+        std::cerr << "Error: Dimensions must be positive and mask_dim must be odd.\n";
+        return 1;
+    }
 
     size_t matrix_size = height * width * sizeof(int);
     size_t mask_size = mask_dim * mask_dim * sizeof(int);
 
-    int *matrix = new int[height * width];
-    int *mask = new int[mask_dim * mask_dim];
-    int *result = new int[height * width];
+    int* h_input = new int[height * width];
+    int* h_output = new int[height * width];
+    int* h_mask = new int[mask_dim * mask_dim];
 
-    //init_matrix(matrix, height, width);
-    init_matrix_constant(matrix, width, height, 1);
-    //init_matrix(mask, mask_dim, mask_dim);
-    init_matrix_constant(mask, mask_dim, mask_dim, 1);
+    initialize_matrix(h_input, height, width, 1);
+    initialize_mask(h_mask, mask_dim, 1);
 
-    int *d_matrix, *d_result, *d_mask;
-    cudaMalloc(&d_matrix, matrix_size);
-    cudaMalloc(&d_result, matrix_size);
-    cudaMalloc(&d_mask, mask_size);
+    int *d_input, *d_output, *d_mask;
+    check_cuda_error(cudaMalloc(&d_input, matrix_size), "cudaMalloc d_input");
+    check_cuda_error(cudaMalloc(&d_output, matrix_size), "cudaMalloc d_output");
+    check_cuda_error(cudaMalloc(&d_mask, mask_size), "cudaMalloc d_mask");
 
-    cudaMemcpy(d_matrix, matrix, matrix_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mask, mask, mask_size, cudaMemcpyHostToDevice);
+    check_cuda_error(cudaMemcpy(d_input, h_input, matrix_size, cudaMemcpyHostToDevice), "cudaMemcpy d_input");
+    check_cuda_error(cudaMemcpy(d_mask, h_mask, mask_size, cudaMemcpyHostToDevice), "cudaMemcpy d_mask");
 
-    int block_size, shared_memory_size;
-    choose_optimal_tile_and_block(block_size, shared_memory_size, mask_dim);
+    dim3 block_dim(16, 16);
+    dim3 grid_dim((width + block_dim.x - 1) / block_dim.x, (height + block_dim.y - 1) / block_dim.y);
 
-    int grid_size_x = (width + block_size - 1) / block_size;
-    int grid_size_y = (height + block_size - 1) / block_size;
-    dim3 block_dim(block_size, block_size);
-    dim3 grid_dim(grid_size_x, grid_size_y);
+      // No tiling version
+    auto start_no_tiling = std::chrono::high_resolution_clock::now();
+    convolution_2d<<<grid_dim, block_dim>>>(d_input, d_output, height, width, d_mask, mask_dim);
+    check_cuda_error(cudaDeviceSynchronize(), "Kernel execution");
+    auto end_no_tiling = std::chrono::high_resolution_clock::now();
 
-    convolution_2d_tiled<<<grid_dim, block_dim, shared_memory_size>>>(d_matrix, d_result, height, width, d_mask, mask_dim);
+    check_cuda_error(cudaMemcpy(h_output, d_output, matrix_size, cudaMemcpyDeviceToHost), "cudaMemcpy h_output");
+    verify_result(h_input, h_mask, h_output, height, width, mask_dim);
+     std::cout << "VERIFY COMPLETED SUCCESSFULLY!\n";
+    //std::cout << "Output Matrix:\n";
+    //for (int i = 0; i < height; i++) {
+       // for (int j = 0; j < width; j++) {
+         //   std::cout << h_output[i * width + j] << " ";
+       // }
+        //std::cout << "\n";
+    //}
+    //print_matrix(h_output, height, width, "result on d2conv on GPU");
 
-    cudaMemcpy(result, d_result, matrix_size, cudaMemcpyDeviceToHost);
+      // CPU version
+    int* result_cpu = new int[height * width];
+    auto start_cpu = std::chrono::high_resolution_clock::now();
+    convolution_2d_cpu(h_input, result_cpu, height, width, h_mask, mask_dim);
+    auto end_cpu = std::chrono::high_resolution_clock::now();
+   // print_matrix(result_cpu, height, width, "result on 2dconv on CPU");
 
-    // Stampa la matrice iniziale, la maschera e il risultato
-    print_matrix(matrix, height, width, "Input Matrix");
-    print_matrix(mask, mask_dim, mask_dim, "Mask");
-    print_matrix(result, height, width, "Result Matrix");
 
-    verify_result(matrix, mask, result, height, width, mask_dim);
 
-    std::cout << "Convolution completed successfully!" << std::endl;
+ std::cout << "Time (GPU No Tiling): "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_no_tiling - start_no_tiling).count()
+              << " ms\n";
 
-    delete[] matrix;
-    delete[] mask;
-    delete[] result;
-    cudaFree(d_matrix);
-    cudaFree(d_result);
-    cudaFree(d_mask);
+    std::cout << "Time (CPU): "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_cpu - start_cpu).count()
+              << " ms\n";
+
+
+    delete[] h_input;
+    delete[] h_output;
+    delete[] h_mask;
+    check_cuda_error(cudaFree(d_input), "cudaFree d_input");
+    check_cuda_error(cudaFree(d_output), "cudaFree d_output");
+    check_cuda_error(cudaFree(d_mask), "cudaFree d_mask");
 
     return 0;
 }
