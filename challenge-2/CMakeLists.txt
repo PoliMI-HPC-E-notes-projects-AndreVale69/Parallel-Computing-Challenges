@@ -3,7 +3,7 @@ project(challenge-2 CUDA)
 
 set(CMAKE_CUDA_STANDARD 20)
 
-add_executable(challenge-2 src/2d-convolution.cu)
+add_executable(challenge-2 src/2d-convolution-tiling.cu)
 
 set_target_properties(challenge-2 PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
