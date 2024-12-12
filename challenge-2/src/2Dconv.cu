@@ -47,31 +47,36 @@ __global__ void convolution_2d_tiled(int* input, int* output, int height, int wi
     int col = blockIdx.x * block_size + thread_col - mask_radius;
     int row = blockIdx.y * block_size + thread_row - mask_radius;
 
-    // Load data into shared memory with boundary checks
-    if (row >= 0 && row < height && col >= 0 && col < width) {
-        shared_mem[thread_row * shared_width + thread_col] = input[row * width + col];
-    } else {
-        shared_mem[thread_row * shared_width + thread_col] = 0;
-    }
+    // Initialize the shared memory to 0
+    shared_mem[thread_row * shared_width + thread_col] = 0;
 
-    __syncthreads();
+    // Load data into shared memory in phases
+    for (int phase = 0; phase < (mask_dim + block_size - 1) / block_size; ++phase) {
+        int phase_col = col + phase * block_size;
 
-    // Compute convolution for threads within valid block range
-    col = blockIdx.x * block_size + threadIdx.x;
-    row = blockIdx.y * block_size + threadIdx.y;
-
-    if (threadIdx.x >= mask_radius && threadIdx.x < block_size + mask_radius &&
-        threadIdx.y >= mask_radius && threadIdx.y < block_size + mask_radius &&
-        col < width && row < height) {
-
-        int result = 0;
-        for (int i = 0; i < mask_dim; i++) {
-            for (int j = 0; j < mask_dim; j++) {
-                result += shared_mem[(threadIdx.y - mask_radius + i) * shared_width + (threadIdx.x - mask_radius + j)] *
-                          mask[i * mask_dim + j];
-            }
+        if (row >= 0 && row < height && phase_col >= 0 && phase_col < width) {
+            shared_mem[thread_row * shared_width + thread_col] = input[row * width + phase_col];
         }
-        output[row * width + col] = result;
+        __syncthreads();
+
+        // Compute partial convolution
+        col = blockIdx.x * block_size + threadIdx.x;
+        row = blockIdx.y * block_size + threadIdx.y;
+
+        if (threadIdx.x >= mask_radius && threadIdx.x < block_size + mask_radius &&
+            threadIdx.y >= mask_radius && threadIdx.y < block_size + mask_radius &&
+            col < width && row < height) {
+
+            int result = 0;
+            for (int i = 0; i < mask_dim; i++) {
+                for (int j = 0; j < mask_dim; j++) {
+                    result += shared_mem[(threadIdx.y - mask_radius + i) * shared_width + (threadIdx.x - mask_radius + j)] *
+                              mask[i * mask_dim + j];
+                }
+            }
+            output[row * width + col] += result;
+        }
+      // __syncthreads();
     }
 }
 
@@ -154,7 +159,7 @@ int main(int argc, char* argv[]) {
     int height = std::atoi(argv[1]);
     int width = std::atoi(argv[2]);
     int mask_dim = std::atoi(argv[3]);
-     int block_size = 16;
+     int block_size = 4;
 
     if (height <= 0 || width <= 0 || mask_dim <= 0 || mask_dim % 2 == 0) {
         std::cerr << "Error: Dimensions must be positive and mask_dim must be odd.\n";
