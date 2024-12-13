@@ -185,7 +185,8 @@ int main() {
             throw invalid_argument("Invalid argument");
         }
     } catch (...) {
-        printf("Error reading MASK_SIZE env variable; it must be an integer.\n");
+        printf("Error reading env variable MASK_SIZE, MATRIX_HEIGHT, MATRIX_WIDTH; "
+            "must be an integer, the dimension must be positive and the dimension of the mask must be odd.");
         return 1;
     }
     // try to get env variable about the seed
