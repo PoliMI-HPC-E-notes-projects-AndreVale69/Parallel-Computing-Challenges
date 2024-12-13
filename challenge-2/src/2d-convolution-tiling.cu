@@ -9,42 +9,6 @@
 using namespace std;
 
 /**
- * Basic 2D convolution kernel (no tiling).
- * @param input Input matrix.
- * @param output Output matrix.
- * @param height Height of the input matrix.
- * @param width Width of the input matrix.
- * @param mask Mask matrix.
- * @param mask_width Width of the mask matrix.
- */
-__global__ void convolution_2d_basic_kernel(
-    const int * input,
-    int * output,
-    const int height,
-    const int width,
-    const int * mask,
-    const int mask_width
-) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
-
-    const int mask_radius = mask_width / 2;
-
-    if (row < height && col < width) {
-        int result = 0;
-        for (int i = -mask_radius; i <= mask_radius; i++) {
-            for (int j = -mask_radius; j <= mask_radius; j++) {
-                const int cur_row = row + i;
-                if (const int cur_col = col + j; cur_row >= 0 && cur_row < height && cur_col >= 0 && cur_col < width) {
-                    result += input[cur_row * width + cur_col] * mask[(i + mask_radius) * mask_width + (j + mask_radius)];
-                }
-            }
-        }
-        output[row * width + col] = result;
-    }
-}
-
-/**
  * 2D convolution kernel with tiling.
  * It optimizes the convolution operation by using shared memory to store the input matrix tile,
  * reducing the number of global memory accesses.
@@ -177,7 +141,14 @@ void create_constant_matrix(float *result, const int rows, const int cols, const
  * @param width Width of the input matrix.
  * @param mask_dim Dimension of the mask matrix.
  */
-void verify_result(const float *matrix, const float *mask, const float *result, const int height, const int width, const int mask_dim) {
+void verify_result(
+    const float *matrix,
+    const float *mask,
+    const float *result,
+    const int height,
+    const int width,
+    const int mask_dim
+) {
     if (matrix == nullptr || mask == nullptr || result == nullptr) {
         throw invalid_argument("Matrix, mask, and result cannot be null");
     }
@@ -309,11 +280,14 @@ int main() {
 
     cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
 
+    printf("Check the result of the convolution operation using the CPU...\n");
     verify_result(input_m, mask, output_m, matrix_height, matrix_width, mask_width);
+    printf("Verification passed!\n");
 
     // debug: print the output matrix
     // print_matrix(output_m, matrix_height, matrix_width);
-    printf("Time elapsed on naive GPU 2D-convolution of %dx%d (block %d, tiling: %d): %f ms.\n\n", matrix_height, matrix_width, BLOCK_WIDTH, N_TILE_WIDTH, naive_gpu_elapsed_time_ms);
+    printf("Time elapsed on naive GPU 2D-convolution of %dx%d (block %d): %f ms.\n\n",
+        matrix_height, matrix_width, BLOCK_WIDTH, naive_gpu_elapsed_time_ms);
 
     cudaFree(cuda_input_m);
     cudaFree(cuda_mask);

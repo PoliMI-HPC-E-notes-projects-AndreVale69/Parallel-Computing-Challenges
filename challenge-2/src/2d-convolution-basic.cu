@@ -113,7 +113,14 @@ void create_constant_matrix(float *result, const int rows, const int cols, const
  * @param width Width of the input matrix.
  * @param mask_dim Dimension of the mask matrix.
  */
-void verify_result(const float *matrix, const float *mask, const float *result, const int height, const int width, const int mask_dim) {
+void verify_result(
+    const float *matrix,
+    const float *mask,
+    const float *result,
+    const int height,
+    const int width,
+    const int mask_dim
+) {
     if (matrix == nullptr || mask == nullptr || result == nullptr) {
         throw invalid_argument("Matrix, mask, and result cannot be null");
     }
