@@ -12,3 +12,8 @@ add_executable(matrix-multiplication src/matrix-multiplication.cu)
 
 set_target_properties(matrix-multiplication PROPERTIES
                       CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(challenge-2-basic src/2d-convolution-basic.cu)
+
+set_target_properties(challenge-2-basic PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
